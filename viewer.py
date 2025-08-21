@@ -8,14 +8,14 @@ import cv2
 
 try:
     from PyQt5.QtWidgets import (
-        QApplication, QWidget, QLabel, QPushButton, QLineEdit,
-        QSlider, QVBoxLayout, QHBoxLayout, QFileDialog, QGroupBox, QFormLayout,
-        QGridLayout, QSizePolicy, QTabWidget, QComboBox
+        QApplication, QWidget, QLabel, QPushButton, QLineEdit, QListWidget,
+        QVBoxLayout, QHBoxLayout, QSizePolicy, QTabWidget,
+        QGroupBox, QMessageBox, QFileDialog, QSlider, QCheckBox, QFormLayout
     )
     from PyQt5.QtCore import Qt, QTimer
-    from PyQt5.QtGui import QImage, QPixmap
-except ModuleNotFoundError as e:
-    print("Erro: PyQt5 não está instalado. Use 'pip install PyQt5' para instalar.")
+    from PyQt5.QtGui import QImage, QPixmap, QFont
+except ModuleNotFoundError:
+    print("Erro: PyQt5 não está instalado. Use 'pip install PyQt5'")
     sys.exit(1)
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -28,18 +28,28 @@ class VideoClient(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("I/O Eye Viewer (PyQt5)")
-        self.setStyleSheet("background-color: black")
+        self.dark_theme = True
+        self.apply_theme()
         self.resize(1280, 720)
 
         self.client_socket = None
         self.running = False
         self.unidades = []
         self.timestamps = []
-    
+        self.total_produtos = 0
+        self.last_update_time = None
+
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_video)
+
         self.init_ui()
         self.start_video()
+
+    def apply_theme(self):
+        if self.dark_theme:
+            self.setStyleSheet("background-color: black; color: white;")
+        else:
+            self.setStyleSheet("background-color: white; color: black;")
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -47,90 +57,140 @@ class VideoClient(QWidget):
         # Tabs
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
-        self.tabs.setStyleSheet("background-color: #1e1e1e; color: white")
 
-        main_tab = QWidget()
-        main_tab.setStyleSheet("background-color: #1e1e1e;")
-        main_layout = QGridLayout(main_tab)
-        self.tabs.addTab(main_tab, "Visualização")
-        self.tabs.addTab(QWidget(), "Tema")
-        self.tabs.addTab(QWidget(), "Ferramentas")
+        # --- Aba Visualização (Viewer + Config Panel lado a lado) ---
+        self.visual_tab = QWidget()
+        visual_layout = QHBoxLayout(self.visual_tab)
 
-        # === Viewer ===
+        # Viewer
         self.video_label = QLabel("Viewer")
-        self.video_label.setStyleSheet("background-color: black; color: white")
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
-        main_layout.addWidget(self.video_label, 0, 0, 1, 2, alignment=Qt.AlignTop)
+        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        visual_layout.addWidget(self.video_label, stretch=3)
 
-        # === Graph ===
-        self.figure = Figure(figsize=(6, 3), facecolor="#1e1e1e")
+        # Config Panel
+        config_box = QVBoxLayout()
+
+        # IP inputs (3 caixas)
+        ip_layout = QHBoxLayout()
+        self.ip_inputs = []
+        for _ in range(3):
+            box = QLineEdit()
+            box.setMaxLength(3)
+            box.setFixedWidth(50)
+            self.ip_inputs.append(box)
+            ip_layout.addWidget(box)
+        config_box.addLayout(ip_layout)
+
+        # Porta
+        porta_layout = QHBoxLayout()
+        self.port_input = QLineEdit("65432")
+        self.port_input.setFixedWidth(80)
+        porta_label = QLabel("Porta:")
+        porta_layout.addWidget(porta_label)
+        porta_layout.addWidget(self.port_input)
+        config_box.addLayout(porta_layout)
+
+        # Buscar IP
+        self.buscar_btn = QPushButton("BUSCAR IP")
+        self.buscar_btn.clicked.connect(self.buscar_dispositivos)
+        config_box.addWidget(self.buscar_btn)
+
+        # Lista de dispositivos com scroll
+        self.device_list = QListWidget()
+        config_box.addWidget(self.device_list)
+
+        # Conectar
+        self.connect_btn = QPushButton("CONECTAR")
+        self.connect_btn.clicked.connect(self.conectar_socket)
+        config_box.addWidget(self.connect_btn)
+
+        # Total
+        total_layout = QHBoxLayout()
+        self.total_label = QLabel("TOTAL:")
+        self.total_value = QLabel("0")
+        total_layout.addWidget(self.total_label)
+        total_layout.addWidget(self.total_value)
+        config_box.addLayout(total_layout)
+
+        # Média por hora
+        media_layout = QHBoxLayout()
+        self.media_label = QLabel("MÉDIA/H:")
+        self.media_value = QLabel("0")
+        media_layout.addWidget(self.media_label)
+        media_layout.addWidget(self.media_value)
+        config_box.addLayout(media_layout)
+
+        visual_layout.addLayout(config_box, stretch=1)
+        self.tabs.addTab(self.visual_tab, "Viewer")
+
+        # --- Aba Tema (gráfico) ---
+        self.tema_tab = QWidget()
+        tema_layout = QVBoxLayout(self.tema_tab)
+
+        self.figure = Figure(figsize=(6, 3))
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumHeight(200)
         self.ax = self.figure.add_subplot(111)
-        self.ax.set_title("Unidades por Hora", color="white")
-        self.ax.set_facecolor("#1e1e1e")
-        self.ax.tick_params(colors="white")
-        self.ax.grid(True, linestyle="--", linewidth=0.5, color="#444")
         self.line, = self.ax.plot([], [], color="#00ffcc", marker='o')
-        main_layout.addWidget(self.canvas, 1, 0, 1, 2, alignment=Qt.AlignTop)
 
-        # === Config Panel ===
-        config_layout = QFormLayout()
+        tema_layout.addWidget(self.canvas)
+        self.tabs.addTab(self.tema_tab, "Rendimento")
 
-        self.source_input = QComboBox()
-        self.source_input.setEditable(False)  
-        self.source_input.setStyleSheet("background-color: #2b2b2b; color: white; border: 1px solid #555;")
-        self.source_input.mousePressEvent = lambda event: self.buscar_dispositivos(event)  # quando clicar, faz a busca
-        self.scale_slider = QSlider(Qt.Horizontal)
-        self.scale_slider.setRange(25, 100)
-        self.scale_slider.setValue(100)
-        
-        self.ip_input = QLineEdit()
+        # --- Aba Ferramentas ---
+        self.ferramentas_tab = QWidget()
+        ferramentas_layout = QHBoxLayout(self.ferramentas_tab)
+
+        # --- Layout (esquerda) ---
+        layout_group = QGroupBox("Layout")
+        layout_form = QFormLayout()
+
+        self.font_slider = QSlider(Qt.Horizontal)
+        self.font_slider.setRange(8, 32)
+        self.font_slider.setValue(12)
+        self.font_slider.valueChanged.connect(self.ajustar_fonte)
+        layout_form.addRow("Tamanho da Fonte", self.font_slider)
+
+        self.theme_switch = QCheckBox("Tema Claro/Escuro")
+        self.theme_switch.stateChanged.connect(self.trocar_tema)
+        layout_form.addRow(self.theme_switch)
+
+        layout_group.setLayout(layout_form)
+
+        # --- Device (direita) ---
+        device_group = QGroupBox("Device")
+        device_form = QFormLayout()
+
+        file_layout = QHBoxLayout()
         self.model_input = QLineEdit()
-        self.model_button = QPushButton("Buscar Modelo")
-        self.model_button.clicked.connect(self.browse_model)
+        self.file_btn = QPushButton("Procurar")
+        self.file_btn.clicked.connect(self.abrir_arquivo)
+        file_layout.addWidget(self.model_input)
+        file_layout.addWidget(self.file_btn)
+        device_form.addRow("Arquivo de Modelo", file_layout)
 
-        self.start_button = QPushButton("Iniciar Vídeo")
-        self.start_button.clicked.connect(self.start_video)
+        self.send_btn = QPushButton("Enviar")
+        device_form.addRow(self.send_btn)
 
-        self.source_input.setStyleSheet("background-color: #2b2b2b; color: white; border: 1px solid #555;")
-        self.ip_input.setStyleSheet("background-color: #2b2b2b; color: white; border: 1px solid #555;")
-        self.model_input.setStyleSheet("background-color: #2b2b2b; color: white; border: 1px solid #555;")
+        self.res_slider = QSlider(Qt.Horizontal)
+        self.res_slider.setRange(25, 100)
+        self.res_slider.setSingleStep(25)
+        self.res_slider.setValue(25)
+        device_form.addRow("Resolução", self.res_slider)
 
-        # self.scale_slider.setStyleSheet("""
-        #     QSlider::groove:horizontal {
-        #         background: #555;
-        #         height: 8px;
-        #         border-radius: 4px;
-        #     }
-        #     QSlider::handle:horizontal {
-        #         background: #00ffcc;
-        #         border: 1px solid #444;
-        #         width: 16px;
-        #         margin: -4px 0;
-        #         border-radius: 8px;
-        #     }
-        # """)
+        self.restart_btn = QPushButton("Reiniciar")
+        self.restart_btn.clicked.connect(self.reiniciar)
+        device_form.addRow(self.restart_btn)
 
-        
-        config_layout.addRow("Fonte de Vídeo:", self.source_input)
-        config_layout.addRow("Escala do Vídeo:", self.scale_slider)
-        config_layout.addRow("IP de Envio:", self.ip_input)
-        config_layout.addRow("Modelo (arquivo):", self.model_input)
-        config_layout.addRow("", self.model_button)
-        config_layout.addRow("", self.start_button)
+        self.reset_btn = QPushButton("Reset de Fábrica")
+        self.reset_btn.clicked.connect(self.reset_fabrica)
+        device_form.addRow(self.reset_btn)
 
-        config_box = QGroupBox("Configurações")
-        config_box.setLayout(config_layout)
-        config_box.setStyleSheet("color: white;")
-        config_box.setMaximumWidth(300)
-        main_layout.addWidget(config_box, 0, 2, 2, 1)
+        device_group.setLayout(device_form)
 
-    def browse_model(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Selecionar Modelo")
-        if path:
-            self.model_input.setText(path)
+        ferramentas_layout.addWidget(layout_group, stretch=1)
+        ferramentas_layout.addWidget(device_group, stretch=1)
+
+        self.tabs.addTab(self.ferramentas_tab, "Ferramentas")
 
     def start_video(self):
         if not self.running:
@@ -142,22 +202,30 @@ class VideoClient(QWidget):
         while self.running:
             try:
                 if self.client_socket is None:
-                    print("Tentando conectar...")
-                    self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    self.client_socket.connect((HOST, PORT))
-                    print("Conectado ao servidor.")
-
-                while self.running:
+                    time.sleep(0.5)
+                else:
                     frame = self.receber_frame()
                     if frame is not None:
                         self.latest_frame = frame
+
             except Exception as e:
                 print(f"Erro de conexão: {e}")
                 if self.client_socket:
                     self.client_socket.close()
-                self.client_socket = None
+                    self.client_socket = None
                 self.latest_frame = self.gerar_frame_exemplo()
                 time.sleep(1)
+
+    def conectar_socket(self):
+        try:
+            ip_parts = [box.text() for box in self.ip_inputs]
+            ip = ".".join(ip_parts) + "." + "1"  # tenta último octeto como 1 ou da lista
+            porta = int(self.port_input.text())
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_socket.connect((ip, porta))
+            QMessageBox.information(self, "Conexão", f"Conectado a {ip}:{porta}")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Falha ao conectar: {e}")
 
     def receber_frame(self):
         try:
@@ -165,14 +233,12 @@ class VideoClient(QWidget):
             if len(size_data) < 4:
                 return None
             frame_size = struct.unpack(">I", size_data)[0]
-
             frame_data = b''
             while len(frame_data) < frame_size:
                 more = self.client_socket.recv(frame_size - len(frame_data))
                 if not more:
                     return None
                 frame_data += more
-
             frame = cv2.imdecode(np.frombuffer(frame_data, dtype=np.uint8), cv2.IMREAD_COLOR)
             return frame
         except:
@@ -186,51 +252,100 @@ class VideoClient(QWidget):
     def update_video(self):
         if hasattr(self, "latest_frame"):
             frame = cv2.cvtColor(self.latest_frame, cv2.COLOR_BGR2RGB)
-
             viewer_width = self.video_label.width()
             viewer_height = int(viewer_width * 9 / 16)
             frame = cv2.resize(frame, (viewer_width, viewer_height), interpolation=cv2.INTER_LINEAR)
-
             h, w, ch = frame.shape
             bytes_per_line = ch * w
             qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
             self.video_label.setPixmap(QPixmap.fromImage(qimg))
 
-            self.unidades.append(len(self.unidades) + 1)
+            # --- Atualiza valores ---
+            self.total_produtos += 1
+            self.total_value.setText(str(self.total_produtos))
+
+            now = time.time()
+            if self.last_update_time:
+                elapsed = now - self.last_update_time
+                if elapsed > 0:
+                    media_hora = (self.total_produtos / elapsed) * 3600
+                    self.media_value.setText(f"{media_hora:.2f}")
+            self.last_update_time = now
+
+            self.unidades.append(self.total_produtos)
             self.timestamps.append(time.strftime("%H:%M:%S"))
             self.update_graph()
 
     def update_graph(self):
         self.unidades = self.unidades[-30:]
         self.timestamps = self.timestamps[-30:]
-
         self.line.set_xdata(np.arange(len(self.unidades)))
         self.line.set_ydata(self.unidades)
         self.ax.set_xlim(0, max(1, len(self.unidades)))
         self.ax.set_ylim(0, max(self.unidades) + 5 if self.unidades else 10)
         self.ax.set_xticks(np.arange(len(self.timestamps)))
-        self.ax.set_xticklabels(self.timestamps, rotation=45, fontsize=8, color="white")
+        self.ax.set_xticklabels(self.timestamps, rotation=45, fontsize=8)
         self.canvas.draw()
 
-    def buscar_dispositivos(self, event):
-        self.source_input.clear()
-        base_ip = "127.0.0."   # ajuste para sua rede
-        porta = 65432
+    def buscar_dispositivos(self):
+        try:
+            ip_parts = [int(box.text()) for box in self.ip_inputs]
+            if any(p < 0 or p > 255 for p in ip_parts):
+                raise ValueError
+        except:
+            QMessageBox.critical(self, "Erro", "Digite um IP válido (0-255 em cada campo)")
+            return
 
+        base_ip = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}."
+        try:
+            porta = int(self.port_input.text())
+        except:
+            porta = 65432
+
+        self.device_list.clear()
         for i in range(1, 255):
             ip = f"{base_ip}{i}"
             try:
-                s = socket.create_connection((ip, porta), timeout=0.1)
+                s = socket.create_connection((ip, porta), timeout=0.05)
                 s.close()
-                self.source_input.addItem(ip)
+                self.device_list.addItem(ip)
             except:
                 pass
+        if self.device_list.count() == 0:
+            self.device_list.addItem("Nenhum dispositivo encontrado")
 
-        if self.source_input.count() == 0:
-            self.source_input.addItem("Nenhum dispositivo encontrado")
+    # --- Funções da aba Ferramentas ---
+    def ajustar_fonte(self, value):
+        font = QFont()
+        font.setPointSize(value)
+        self.setFont(font)
 
-        # mantém o comportamento padrão do clique
-        QComboBox.mousePressEvent(self.source_input, event)
+    def trocar_tema(self, state):
+        self.dark_theme = not self.dark_theme if state == Qt.Checked else True
+        self.apply_theme()
+
+    def abrir_arquivo(self):
+        fname, _ = QFileDialog.getOpenFileName(self, 'Abrir arquivo de modelo', '', 'Todos os arquivos (*)')
+        if fname:
+            self.model_input.setText(fname)
+
+    def reiniciar(self):
+        QMessageBox.information(self, "Reiniciar", "Reiniciando...")
+        self.running = False
+        if self.client_socket:
+            self.client_socket.close()
+            self.client_socket = None
+        self.start_video()
+
+    def reset_fabrica(self):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Reset de Fábrica")
+        msg.setText("Você quer mesmo realizar o reset de fábrica?")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.No)
+        result = msg.exec_()
+        if result == QMessageBox.Yes:
+            QMessageBox.warning(self, "Reset de Fábrica", "O dispositivo foi resetado para configuração de fábrica.")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
