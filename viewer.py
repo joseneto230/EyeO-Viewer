@@ -3,6 +3,8 @@ import socket
 import struct
 import threading
 import time
+import json
+import os
 import numpy as np
 import cv2
 
@@ -10,7 +12,8 @@ try:
     from PyQt5.QtWidgets import (
         QApplication, QWidget, QLabel, QPushButton, QLineEdit, QListWidget,
         QVBoxLayout, QHBoxLayout, QSizePolicy, QTabWidget,
-        QGroupBox, QMessageBox, QFileDialog, QSlider, QCheckBox, QFormLayout, QFrame
+        QGroupBox, QMessageBox, QFileDialog, QSlider, QCheckBox, QFormLayout, QFrame,
+        QComboBox, QTextEdit, QSpinBox
     )
     from PyQt5.QtCore import Qt, QTimer
     from PyQt5.QtGui import QImage, QPixmap, QFont
@@ -23,6 +26,19 @@ from matplotlib.figure import Figure
 
 HOST = '127.0.0.1'
 PORT = 65432
+CONFIG_FILENAME = 'config.json'
+
+# Default config used for validation / initial values
+DEFAULT_CONFIG = {
+    "scale_percent": 25,
+    "width": 1920,
+    "height": 1080,
+    "modbus_ip": "127.0.0.1",
+    "modbus_port": 502,
+    "host": "127.0.0.1",
+    "port": 65432,
+    "roi": [[189,485],[1855,13],[1813,653],[210,1014]]
+}
 
 class VideoClient(QWidget):
     def __init__(self):
@@ -118,6 +134,7 @@ class VideoClient(QWidget):
         # Config Panel
         config_box = QVBoxLayout()
 
+        # IP inputs (3 parts) and label
         ip_layout = QHBoxLayout()
         ip_label = QLabel("Faixa IP:")
         ip_layout.addWidget(ip_label)
@@ -130,9 +147,10 @@ class VideoClient(QWidget):
             ip_layout.addWidget(box)
         config_box.addLayout(ip_layout)
 
+        # Porta
         porta_layout = QHBoxLayout()
         porta_label = QLabel("Porta:")
-        self.port_input = QLineEdit("65432")
+        self.port_input = QLineEdit(str(DEFAULT_CONFIG['port']))
         self.port_input.setFixedWidth(80)
         porta_layout.addWidget(porta_label)
         porta_layout.addWidget(self.port_input)
@@ -176,58 +194,127 @@ class VideoClient(QWidget):
         tema_layout.addWidget(self.canvas)
         self.tabs.addTab(self.tema_tab, "Rendimento")
 
-        # --- Aba Ferramentas ---
+        # --- Aba Ferramentas (config JSON) ---
         self.ferramentas_tab = QWidget()
         ferramentas_layout = QHBoxLayout(self.ferramentas_tab)
 
-        layout_group = QGroupBox("Layout")
-        layout_form = QFormLayout()
+        # left: config fields
+        cfg_group = QGroupBox("Configurações (config.json)")
+        cfg_form = QFormLayout()
 
-        self.font_slider = QSlider(Qt.Horizontal)
-        self.font_slider.setRange(8, 32)
-        self.font_slider.setValue(12)
-        self.font_slider.valueChanged.connect(self.ajustar_fonte)
-        layout_form.addRow("Tamanho da Fonte", self.font_slider)
+        # scale_percent
+        self.scale_spin = QSpinBox()
+        self.scale_spin.setRange(1, 100)
+        self.scale_spin.setValue(DEFAULT_CONFIG['scale_percent'])
+        cfg_form.addRow("scale_percent", self.scale_spin)
 
-        self.theme_switch = QCheckBox("Tema Claro/Escuro")
-        self.theme_switch.stateChanged.connect(self.trocar_tema)
-        layout_form.addRow(self.theme_switch)
+        # resolution dropdown -> sets width/height
+        self.res_combo = QComboBox()
+        # resolutions from 8K to 480p
+        RESOLUTIONS = [
+            ("8K (7680x4320)", 7680, 4320),
+            ("5K (5120x2880)", 5120, 2880),
+            ("4K (3840x2160)", 3840, 2160),
+            ("1440p (2560x1440)", 2560, 1440),
+            ("1080p (1920x1080)", 1920, 1080),
+            ("720p (1280x720)", 1280, 720),
+            ("480p (854x480)", 854, 480),
+            ("270p (480x270)", 480,270)
+        ]
+        for name, w, h in RESOLUTIONS:
+            self.res_combo.addItem(name, (w, h))
+        # default select based on DEFAULT_CONFIG
+        for i in range(self.res_combo.count()):
+            w,h = self.res_combo.itemData(i)
+            if w == DEFAULT_CONFIG['width'] and h == DEFAULT_CONFIG['height']:
+                self.res_combo.setCurrentIndex(i)
+                break
+        cfg_form.addRow("Resolução", self.res_combo)
 
-        layout_group.setLayout(layout_form)
+        # width / height display (read-only)
+        self.width_label = QLabel(str(DEFAULT_CONFIG['width']))
+        self.height_label = QLabel(str(DEFAULT_CONFIG['height']))
+        cfg_form.addRow("Width", self.width_label)
+        cfg_form.addRow("Height", self.height_label)
 
-        device_group = QGroupBox("Device")
-        device_form = QFormLayout()
+        # modbus ip (4 fields) and port (default 502)
+        modbus_ip_layout = QHBoxLayout()
+        self.modbus_ip_inputs = []
+        for _ in range(4):
+            e = QLineEdit()
+            e.setMaxLength(3)
+            e.setFixedWidth(45)
+            self.modbus_ip_inputs.append(e)
+            modbus_ip_layout.addWidget(e)
+        self.modbus_port_input = QLineEdit(str(DEFAULT_CONFIG['modbus_port']))
+        self.modbus_port_input.setFixedWidth(80)
+        cfg_form.addRow("Modbus IP", modbus_ip_layout)
+        cfg_form.addRow("Modbus Port", self.modbus_port_input)
 
-        file_layout = QHBoxLayout()
-        self.model_input = QLineEdit()
-        self.file_btn = QPushButton("Procurar")
-        self.file_btn.clicked.connect(self.abrir_arquivo)
-        file_layout.addWidget(self.model_input)
-        file_layout.addWidget(self.file_btn)
-        device_form.addRow("Arquivo de Modelo", file_layout)
+        # host ip (4 fields) and port (default 65432)
+        host_ip_layout = QHBoxLayout()
+        self.host_ip_inputs = []
+        for _ in range(4):
+            e = QLineEdit()
+            e.setMaxLength(3)
+            e.setFixedWidth(45)
+            self.host_ip_inputs.append(e)
+            host_ip_layout.addWidget(e)
+        self.host_port_input = QLineEdit(str(DEFAULT_CONFIG['port']))
+        self.host_port_input.setFixedWidth(80)
+        cfg_form.addRow("Host IP", host_ip_layout)
+        cfg_form.addRow("Host Port", self.host_port_input)
 
-        self.send_btn = QPushButton("Enviar")
-        device_form.addRow(self.send_btn)
+        # ROI (text area with JSON)
+        self.roi_edit = QTextEdit()
+        self.roi_edit.setPlainText(json.dumps(DEFAULT_CONFIG['roi']))
+        cfg_form.addRow("ROI (JSON list)", self.roi_edit)
 
-        self.res_slider = QSlider(Qt.Horizontal)
-        self.res_slider.setRange(25, 100)
-        self.res_slider.setSingleStep(25)
-        self.res_slider.setValue(25)
-        device_form.addRow("Resolução", self.res_slider)
+        cfg_group.setLayout(cfg_form)
 
-        self.restart_btn = QPushButton("Reiniciar")
-        self.restart_btn.clicked.connect(self.reiniciar)
-        device_form.addRow(self.restart_btn)
+        # right: actions
+        actions_group = QGroupBox("Ações")
+        actions_form = QFormLayout()
 
-        self.reset_btn = QPushButton("Reset de Fábrica")
-        self.reset_btn.clicked.connect(self.reset_fabrica)
-        device_form.addRow(self.reset_btn)
+        self.send_cfg_btn = QPushButton("Enviar Config (socket)")
+        self.send_cfg_btn.clicked.connect(self.send_config_via_socket)
+        actions_form.addRow(self.send_cfg_btn)
 
-        device_group.setLayout(device_form)
+        self.save_local_btn = QPushButton("Salvar local (arquivo)")
+        self.save_local_btn.clicked.connect(self.save_config_local)
+        actions_form.addRow(self.save_local_btn)
 
-        ferramentas_layout.addWidget(layout_group, stretch=1)
-        ferramentas_layout.addWidget(device_group, stretch=1)
+        self.start_listener_btn = QPushButton("Iniciar Listener (recebe e atualiza json)")
+        self.start_listener_btn.clicked.connect(self.start_listener_thread)
+        actions_form.addRow(self.start_listener_btn)
+
+        actions_group.setLayout(actions_form)
+
+        ferramentas_layout.addWidget(cfg_group, stretch=2)
+        ferramentas_layout.addWidget(actions_group, stretch=1)
         self.tabs.addTab(self.ferramentas_tab, "Ferramentas")
+
+        # wire resolution change
+        self.res_combo.currentIndexChanged.connect(self.on_resolution_changed)
+        # prefill host/modbus from defaults
+        self._prefill_ip_fields()
+
+    def _prefill_ip_fields(self):
+        # fill default host and modbus ip
+        def fill_ip_fields(ip_str, inputs):
+            parts = ip_str.split('.')
+            for i in range(4):
+                if i < len(parts):
+                    inputs[i].setText(parts[i])
+                else:
+                    inputs[i].setText('0')
+        fill_ip_fields(DEFAULT_CONFIG['host'], self.host_ip_inputs)
+        fill_ip_fields(DEFAULT_CONFIG['modbus_ip'], self.modbus_ip_inputs)
+
+    def on_resolution_changed(self, idx):
+        w,h = self.res_combo.itemData(idx)
+        self.width_label.setText(str(w))
+        self.height_label.setText(str(h))
 
     def start_video(self):
         if not self.running:
@@ -335,7 +422,7 @@ class VideoClient(QWidget):
         try:
             porta = int(self.port_input.text())
         except:
-            porta = 65432
+            porta = DEFAULT_CONFIG['port']
 
         self.device_list.clear()
         for i in range(1, 255):
@@ -348,6 +435,212 @@ class VideoClient(QWidget):
                 pass
         if self.device_list.count() == 0:
             self.device_list.addItem("Nenhum dispositivo encontrado")
+
+    def validar_ip_fields(self, inputs):
+        parts = []
+        try:
+            for box in inputs:
+                v = int(box.text())
+                if v < 0 or v > 255:
+                    return None
+                parts.append(str(v))
+        except:
+            return None
+        return '.'.join(parts)
+
+    def coletar_config_from_ui(self):
+        # assemble dict from UI, validate types
+        config = {}
+        config['scale_percent'] = int(self.scale_spin.value())
+        w = int(self.width_label.text())
+        h = int(self.height_label.text())
+        config['width'] = w
+        config['height'] = h
+
+        modbus_ip = self.validar_ip_fields(self.modbus_ip_inputs)
+        if not modbus_ip:
+            raise ValueError('Modbus IP inválido')
+        config['modbus_ip'] = modbus_ip
+        try:
+            config['modbus_port'] = int(self.modbus_port_input.text())
+        except:
+            raise ValueError('Modbus port inválida')
+
+        host_ip = self.validar_ip_fields(self.host_ip_inputs)
+        if not host_ip:
+            raise ValueError('Host IP inválido')
+        config['host'] = host_ip
+        try:
+            config['port'] = int(self.host_port_input.text())
+        except:
+            raise ValueError('Host port inválida')
+
+        # roi parse
+        try:
+            roi = json.loads(self.roi_edit.toPlainText())
+            if not (isinstance(roi, list) and all(isinstance(p, list) and len(p) == 2 for p in roi)):
+                raise ValueError
+            config['roi'] = roi
+        except Exception:
+            raise ValueError('ROI inválido - deve ser lista de pares [[x,y],...]')
+
+        return config
+
+    def send_config_via_socket(self):
+        try:
+            cfg = self.coletar_config_from_ui()
+        except ValueError as e:
+            QMessageBox.critical(self, 'Erro', str(e))
+            return
+
+        # send to host:port via TCP
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect((cfg['host'], cfg['port']))
+            payload = json.dumps({'cmd': 'update_config', 'config': cfg}).encode('utf-8')
+            # prefix length
+            s.sendall(struct.pack('>I', len(payload)) + payload)
+            s.close()
+            QMessageBox.information(self, 'Enviado', f"Config enviada a {cfg['host']}:{cfg['port']}")
+        except Exception as e:
+            QMessageBox.critical(self, 'Erro', f"Falha ao enviar config: {e}")
+
+    def save_config_local(self):
+        try:
+            cfg = self.coletar_config_from_ui()
+        except ValueError as e:
+            QMessageBox.critical(self, 'Erro', str(e))
+            return
+        try:
+            with open(CONFIG_FILENAME, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, indent=4)
+            QMessageBox.information(self, 'Salvo', f"Config salva em {os.path.abspath(CONFIG_FILENAME)}")
+        except Exception as e:
+            QMessageBox.critical(self, 'Erro', f"Falha ao salvar arquivo: {e}")
+
+    # listener that receives a JSON payload via socket and updates local config file
+    def start_listener_thread(self):
+        t = threading.Thread(target=self._listener_server, daemon=True)
+        t.start()
+        QMessageBox.information(self, 'Listener', 'Listener iniciado em background (porta 65432)')
+
+    def _listener_server(self, listen_port=DEFAULT_CONFIG['port']):
+        # listens for incoming config update messages and writes config.json
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('0.0.0.0', listen_port))
+        srv.listen(1)
+        while True:
+            conn, addr = srv.accept()
+            try:
+                size_data = conn.recv(4)
+                if len(size_data) < 4:
+                    conn.close(); continue
+                payload_len = struct.unpack('>I', size_data)[0]
+                data = b''
+                while len(data) < payload_len:
+                    more = conn.recv(payload_len - len(data))
+                    if not more:
+                        break
+                    data += more
+                try:
+                    msg = json.loads(data.decode('utf-8'))
+                    if msg.get('cmd') == 'update_config' and 'config' in msg:
+                        cfg = msg['config']
+                        # basic validation
+                        if 'host' in cfg and 'port' in cfg:
+                            with open(CONFIG_FILENAME, 'w', encoding='utf-8') as f:
+                                json.dump(cfg, f, indent=4)
+                except Exception as e:
+                    print('Erro ao processar payload:', e)
+            finally:
+                conn.close()
+
+    def validar_ip_fields(self, inputs):
+        parts = []
+        try:
+            for box in inputs:
+                v = int(box.text())
+                if v < 0 or v > 255:
+                    return None
+                parts.append(str(v))
+        except:
+            return None
+        return '.'.join(parts)
+
+    def coletar_config_from_ui(self):
+        # assemble dict from UI, validate types
+        config = {}
+        config['scale_percent'] = int(self.scale_spin.value())
+        w = int(self.width_label.text())
+        h = int(self.height_label.text())
+        config['width'] = w
+        config['height'] = h
+
+        modbus_ip = self.validar_ip_fields(self.modbus_ip_inputs)
+        if not modbus_ip:
+            raise ValueError('Modbus IP inválido')
+        config['modbus_ip'] = modbus_ip
+        try:
+            config['modbus_port'] = int(self.modbus_port_input.text())
+        except:
+            raise ValueError('Modbus port inválida')
+
+        host_ip = self.validar_ip_fields(self.host_ip_inputs)
+        if not host_ip:
+            raise ValueError('Host IP inválido')
+        config['host'] = host_ip
+        try:
+            config['port'] = int(self.host_port_input.text())
+        except:
+            raise ValueError('Host port inválida')
+
+        # roi parse
+        try:
+            roi = json.loads(self.roi_edit.toPlainText())
+            if not (isinstance(roi, list) and all(isinstance(p, list) and len(p) == 2 for p in roi)):
+                raise ValueError
+            config['roi'] = roi
+        except Exception:
+            raise ValueError('ROI inválido - deve ser lista de pares [[x,y],...]')
+
+        return config
+
+    def send_config_via_socket(self):
+        try:
+            cfg = self.coletar_config_from_ui()
+        except ValueError as e:
+            QMessageBox.critical(self, 'Erro', str(e))
+            return
+
+        # send to host:port via TCP
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect((cfg['host'], cfg['port']))
+            payload = json.dumps({'cmd': 'update_config', 'config': cfg}).encode('utf-8')
+            # prefix length
+            s.sendall(struct.pack('>I', len(payload)) + payload)
+            s.close()
+            QMessageBox.information(self, 'Enviado', f"Config enviada a {cfg['host']}:{cfg['port']}")
+        except Exception as e:
+            QMessageBox.critical(self, 'Erro', f"Falha ao enviar config: {e}")
+
+    def save_config_local(self):
+        try:
+            cfg = self.coletar_config_from_ui()
+        except ValueError as e:
+            QMessageBox.critical(self, 'Erro', str(e))
+            return
+        try:
+            with open(CONFIG_FILENAME, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, indent=4)
+            QMessageBox.information(self, 'Salvo', f"Config salva em {os.path.abspath(CONFIG_FILENAME)}")
+        except Exception as e:
+            QMessageBox.critical(self, 'Erro', f"Falha ao salvar arquivo: {e}")
+
+    # remaining methods (receiving frames, UI helpers, etc.) remain as before
 
     def ajustar_fonte(self, value):
         font = QFont()
