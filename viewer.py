@@ -6,6 +6,7 @@ import time
 import json
 import os
 import numpy as np
+import queue
 import cv2
 
 try:
@@ -56,6 +57,8 @@ class VideoClient(QWidget):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_video)
+        # queue used by background IP scanner thread to push discovered IPs
+        self.ip_queue = queue.Queue()
 
         self.init_ui()
         self.apply_theme()
@@ -163,6 +166,18 @@ class VideoClient(QWidget):
         self.device_list = QListWidget()
         config_box.addWidget(self.device_list)
 
+        # History list for discovered IPs (removable via context menu)
+        self.history_list = QListWidget()
+        self.history_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.history_list.customContextMenuRequested.connect(self._history_context_menu)
+        config_box.addWidget(QLabel("Histórico de IPs:"))
+        config_box.addWidget(self.history_list)
+
+        # start a timer to poll the ip_queue and add found IPs to lists
+        self.ip_poll_timer = QTimer()
+        self.ip_poll_timer.timeout.connect(self._poll_ip_queue)
+        self.ip_poll_timer.start(200)
+
         self.connect_btn = QPushButton("CONECTAR")
         self.connect_btn.clicked.connect(self.conectar_socket)
         config_box.addWidget(self.connect_btn)
@@ -219,7 +234,7 @@ class VideoClient(QWidget):
             ("1080p (1920x1080)", 1920, 1080),
             ("720p (1280x720)", 1280, 720),
             ("480p (854x480)", 854, 480),
-            ("270p (480x270)", 480,270)
+            ("240p (480X240)",480, 240)
         ]
         for name, w, h in RESOLUTIONS:
             self.res_combo.addItem(name, (w, h))
@@ -266,9 +281,14 @@ class VideoClient(QWidget):
         cfg_form.addRow("Host Port", self.host_port_input)
 
         # ROI (text area with JSON)
-        self.roi_edit = QTextEdit()
-        self.roi_edit.setPlainText(json.dumps(DEFAULT_CONFIG['roi']))
-        cfg_form.addRow("ROI (JSON list)", self.roi_edit)
+        # ROI replaced by interactive selector (only active quando conectado)
+        self.roi = DEFAULT_CONFIG['roi']
+        self.roi_label = QLabel(str(self.roi))
+        self.definir_roi_btn = QPushButton("Definir ROI (área de interesse)")
+        self.definir_roi_btn.setEnabled(False)
+        self.definir_roi_btn.clicked.connect(self.start_roi_selector)
+        cfg_form.addRow("ROI", self.roi_label)
+        cfg_form.addRow(self.definir_roi_btn)
 
         cfg_group.setLayout(cfg_form)
 
@@ -284,15 +304,48 @@ class VideoClient(QWidget):
         self.save_local_btn.clicked.connect(self.save_config_local)
         actions_form.addRow(self.save_local_btn)
 
+        self.load_local_btn = QPushButton("Carregar último save")
+        self.load_local_btn.clicked.connect(self.load_config_local)
+        actions_form.addRow(self.load_local_btn)
+
         self.start_listener_btn = QPushButton("Iniciar Listener (recebe e atualiza json)")
         self.start_listener_btn.clicked.connect(self.start_listener_thread)
         actions_form.addRow(self.start_listener_btn)
+
+        # contador listener (recebe updates do contador para atualizar total/graph)
+        self.start_counter_btn = QPushButton("Iniciar Listener de Contador")
+        self.start_counter_btn.clicked.connect(self.start_counter_listener_thread)
+        actions_form.addRow(self.start_counter_btn)
 
         actions_group.setLayout(actions_form)
 
         ferramentas_layout.addWidget(cfg_group, stretch=2)
         ferramentas_layout.addWidget(actions_group, stretch=1)
         self.tabs.addTab(self.ferramentas_tab, "Ferramentas")
+
+        # --- Nova Aba Aparencia (mover controles de tema e fonte para cá) ---
+        self.aparencia_tab = QWidget()
+        aparencia_layout = QVBoxLayout(self.aparencia_tab)
+        aparencia_group = QGroupBox("Aparência")
+        aparencia_form = QFormLayout()
+
+        # slider e switch movidos para Aparência
+        self.font_slider = QSlider(Qt.Horizontal)
+        self.font_slider.setRange(8, 32)
+        self.font_slider.setValue(12)
+        self.font_slider.valueChanged.connect(self.ajustar_fonte)
+        aparencia_form.addRow("Tamanho da Fonte", self.font_slider)
+
+        self.theme_switch = QCheckBox("Tema Claro/Escuro")
+        self.theme_switch.stateChanged.connect(self.trocar_tema)
+        aparencia_form.addRow(self.theme_switch)
+
+        # Comentários: aqui é possível adicionar seletor de cores (QColorDialog),
+        # preview de tema, ou presets de aparência. (opções deixadas como sugestão)
+
+        aparencia_group.setLayout(aparencia_form)
+        aparencia_layout.addWidget(aparencia_group)
+        self.tabs.addTab(self.aparencia_tab, "Aparência")
 
         # wire resolution change
         self.res_combo.currentIndexChanged.connect(self.on_resolution_changed)
@@ -347,6 +400,11 @@ class VideoClient(QWidget):
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((ip, porta))
             QMessageBox.information(self, "Conexão", f"Conectado a {ip}:{porta}")
+            # enable ROI definition when connected to a camera
+            try:
+                self.definir_roi_btn.setEnabled(True)
+            except AttributeError:
+                pass
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Falha ao conectar: {e}")
 
@@ -410,31 +468,200 @@ class VideoClient(QWidget):
         self.canvas.draw()
 
     def buscar_dispositivos(self):
+        """Start threaded IP scan and stream results into the UI via a queue.
+        This avoids blocking the GUI while scanning 1..254 addresses.
+        """
         try:
             ip_parts = [int(box.text()) for box in self.ip_inputs]
             if any(p < 0 or p > 255 for p in ip_parts):
                 raise ValueError
-        except:
+        except Exception:
             QMessageBox.critical(self, "Erro", "Digite um IP válido (0-255 em cada campo)")
             return
 
-        base_ip = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}."
         try:
             porta = int(self.port_input.text())
         except:
             porta = DEFAULT_CONFIG['port']
 
+        # clear current lists
         self.device_list.clear()
+        # start background thread to scan
+        t = threading.Thread(target=self._ip_scanner_thread, args=(ip_parts, porta), daemon=True)
+        t.start()
+
+    def _ip_scanner_thread(self, ip_parts, porta):
+        base = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}."
         for i in range(1, 255):
-            ip = f"{base_ip}{i}"
+            ip = f"{base}{i}"
             try:
-                s = socket.create_connection((ip, porta), timeout=0.05)
+                s = socket.create_connection((ip, porta), timeout=0.08)
                 s.close()
-                self.device_list.addItem(ip)
+                # push to queue for main thread to add
+                self.ip_queue.put(ip)
             except:
                 pass
-        if self.device_list.count() == 0:
-            self.device_list.addItem("Nenhum dispositivo encontrado")
+
+    def _poll_ip_queue(self):
+        while not self.ip_queue.empty():
+            ip = self.ip_queue.get()
+            # add to device list and history
+            self.device_list.addItem(ip)
+            self.history_list.addItem(ip)
+
+    def _history_context_menu(self, pos):
+        item = self.history_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMessageBox(self)
+        # simple confirmation dialog to remove
+        reply = QMessageBox.question(self, 'Remover IP', f"Remover {item.text()} do histórico?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            row = self.history_list.row(item)
+            self.history_list.takeItem(row)
+
+
+    def load_config_local(self):
+        # loads last saved config.json and populate UI fields
+        if not os.path.exists(CONFIG_FILENAME):
+            QMessageBox.warning(self, 'Aviso', 'Arquivo config.json não encontrado')
+            return
+        try:
+            with open(CONFIG_FILENAME, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, 'Erro', f'Falha ao ler arquivo: {e}')
+            return
+        # populate fields
+        try:
+            self.scale_spin.setValue(int(cfg.get('scale_percent', DEFAULT_CONFIG['scale_percent'])))
+            w = int(cfg.get('width', DEFAULT_CONFIG['width']))
+            h = int(cfg.get('height', DEFAULT_CONFIG['height']))
+            # select resolution matching width/height if available
+            for i in range(self.res_combo.count()):
+                ww, hh = self.res_combo.itemData(i)
+                if ww == w and hh == h:
+                    self.res_combo.setCurrentIndex(i)
+                    break
+            # modbus
+            parts = cfg.get('modbus_ip', DEFAULT_CONFIG['modbus_ip']).split('.')
+            for i, box in enumerate(self.modbus_ip_inputs):
+                box.setText(parts[i] if i < len(parts) else '0')
+            self.modbus_port_input.setText(str(cfg.get('modbus_port', DEFAULT_CONFIG['modbus_port'])))
+            # host
+            parts = cfg.get('host', DEFAULT_CONFIG['host']).split('.')
+            for i, box in enumerate(self.host_ip_inputs):
+                box.setText(parts[i] if i < len(parts) else '0')
+            self.host_port_input.setText(str(cfg.get('port', DEFAULT_CONFIG['port'])))
+            # roi
+            self.roi = cfg.get('roi', DEFAULT_CONFIG['roi'])
+            try:
+                self.roi_label.setText(str(self.roi))
+            except:
+                pass
+            QMessageBox.information(self, 'Carregado', 'Configuração carregada do arquivo')
+        except Exception as e:
+            QMessageBox.critical(self, 'Erro', f'Falha ao popular UI: {e}')
+
+    def start_roi_selector(self):
+        # opens an OpenCV window that shows frames and lets user click 4 points
+        if self.client_socket is None and not hasattr(self, 'latest_frame'):
+            QMessageBox.warning(self, 'ROI', 'Conecte-se a uma câmera primeiro')
+            return
+        t = threading.Thread(target=self._roi_selector_thread, daemon=True)
+        t.start()
+
+    def _roi_selector_thread(self):
+        pts = []
+        win_name = 'Definir ROI - clique 4 pontos (r=redefinir, c=confirmar)'
+        cv2.namedWindow(win_name)
+
+        def on_mouse(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                if len(pts) < 4:
+                    pts.append((x, y))
+
+        cv2.setMouseCallback(win_name, on_mouse)
+
+        while True:
+            if hasattr(self, 'latest_frame'):
+                frame = self.latest_frame.copy()
+            else:
+                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(frame, 'SEM VIDEO', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+
+            # draw points and polygon edges
+            for p in pts:
+                cv2.circle(frame, p, 5, (0,255,0), -1)
+            if len(pts) == 4:
+                cv2.polylines(frame, [np.array(pts)], isClosed=True, color=(0,255,0), thickness=2)
+
+            cv2.imshow(win_name, frame)
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord('r'):
+                pts = []
+            if key == ord('c') and len(pts) == 4:
+                # confirm
+                self.roi = pts.copy()
+                try:
+                    # update label in main thread via Qt
+                    self.roi_label.setText(str(self.roi))
+                except:
+                    pass
+                break
+            # allow window close via Esc
+            if key == 27:
+                break
+        cv2.destroyWindow(win_name)
+
+    def start_counter_listener_thread(self):
+        # listens for counter JSON messages to update total, media and graph
+        try:
+            listen_port = int(self.host_port_input.text()) + 1
+        except:
+            listen_port = DEFAULT_CONFIG['port'] + 1
+        t = threading.Thread(target=self._counter_listener, args=(listen_port,), daemon=True)
+        t.start()
+        QMessageBox.information(self, 'Listener', f'Listener do contador iniciado em {listen_port}')
+
+    def _counter_listener(self, listen_port):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('0.0.0.0', listen_port))
+        srv.listen(1)
+        while True:
+            conn, addr = srv.accept()
+            try:
+                size_data = conn.recv(4)
+                if len(size_data) < 4:
+                    conn.close(); continue
+                payload_len = struct.unpack('>I', size_data)[0]
+                data = b''
+                while len(data) < payload_len:
+                    more = conn.recv(payload_len - len(data))
+                    if not more:
+                        break
+                    data += more
+                try:
+                    msg = json.loads(data.decode('utf-8'))
+                    # expected format: {"type":"counter","total":123}
+                    if msg.get('type') == 'counter' and 'total' in msg:
+                        total = int(msg['total'])
+                        # update UI in main thread via queued call
+                        self.total_produtos = total
+                        # update graph arrays
+                        self.unidades.append(self.total_produtos)
+                        self.timestamps.append(time.strftime("%H:%M:%S"))
+                        # cap lists
+                        self.unidades = self.unidades[-30:]
+                        self.timestamps = self.timestamps[-30:]
+                        # update labels using Qt via QTimer singleShot
+                        QTimer.singleShot(0, lambda: self.total_value.setText(str(self.total_produtos)))
+                        QTimer.singleShot(0, lambda: self.update_graph())
+                except Exception as e:
+                    print('Erro ao processar contador payload:', e)
+            finally:
+                conn.close()
 
     def validar_ip_fields(self, inputs):
         parts = []
