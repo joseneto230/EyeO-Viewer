@@ -8,6 +8,8 @@ import os
 import numpy as np
 import queue
 import cv2
+import mysql.connector
+
 
 try:
     from PyQt5.QtWidgets import (
@@ -29,6 +31,14 @@ HOST = '127.0.0.1'
 PORT = 65432
 CONFIG_FILENAME = 'config.json'
 
+DB_NAME = "EYEO"
+DB_CONFIG = {
+    "user": "root",
+    "password": "SSAautom@369741",
+    "host": "127.0.0.1",
+    "port": 3306
+}
+
 # Default config used for validation / initial values
 DEFAULT_CONFIG = {
     "scale_percent": 25,
@@ -44,7 +54,7 @@ DEFAULT_CONFIG = {
 class VideoClient(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("I/O Eye Viewer (PyQt5)")
+        self.setWindowTitle("Eye/O Viewer")
         self.dark_theme = True
         self.resize(1280, 720)
 
@@ -53,7 +63,8 @@ class VideoClient(QWidget):
         self.unidades = []
         self.timestamps = []
         self.total_produtos = 0
-        self.last_update_time = None
+        self.last_update_time = 0
+        self.last_produtos = 0
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_video)
@@ -441,20 +452,29 @@ class VideoClient(QWidget):
             qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
             self.video_label.setPixmap(QPixmap.fromImage(qimg))
 
-            self.total_produtos += 1
+            try:
+                conn = mysql.connector.connect(**DB_CONFIG)
+                cursor = conn.cursor()
+                cursor.execute(f"USE {DB_NAME}")
+                cursor.execute("SELECT quant FROM chiken_count_current WHERE id=1")
+                response = cursor.fetchone()
+            except:
+                pass
+            self.total_produtos = response[0]
             self.total_value.setText(str(self.total_produtos))
 
             now = time.time()
-            if self.last_update_time:
-                elapsed = now - self.last_update_time
-                if elapsed > 0:
-                    media_hora = (self.total_produtos / elapsed) * 3600
-                    self.media_value.setText(f"{media_hora:.2f}")
-            self.last_update_time = now
+            elapsed = now - self.last_update_time
+            if elapsed > 10:
+                
+                media_hora = ((self.total_produtos - self.last_produtos) / elapsed) * 3600
+                self.media_value.setText(f"{media_hora:.2f}")
+                self.last_update_time = now
+                self.last_produtos = self.total_produtos
 
-            self.unidades.append(self.total_produtos)
-            self.timestamps.append(time.strftime("%H:%M:%S"))
-            self.update_graph()
+                self.unidades.append(media_hora)
+                self.timestamps.append(time.strftime("%H:%M:%S"))
+                self.update_graph()
 
     def update_graph(self):
         self.unidades = self.unidades[-30:]
@@ -586,6 +606,9 @@ class VideoClient(QWidget):
         while True:
             if hasattr(self, 'latest_frame'):
                 frame = self.latest_frame.copy()
+                h,w = frame.shape[0],frame.shape[1]
+                frame = cv2.resize(frame, (int(w/2), int(h/2)))
+
             else:
                 frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(frame, 'SEM VIDEO', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
@@ -602,6 +625,7 @@ class VideoClient(QWidget):
                 pts = []
             if key == ord('c') and len(pts) == 4:
                 # confirm
+                pts = [(p[0]*2, p[1]*2) for p in pts]
                 self.roi = pts.copy()
                 try:
                     # update label in main thread via Qt
