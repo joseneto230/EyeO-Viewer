@@ -1,0 +1,1 @@
+criar outro arquivo ou forma de quardar os ips encontrados para serem carregados no historico no inicio da inicialização do app

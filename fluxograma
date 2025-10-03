@@ -1,0 +1,6 @@
+// Fluxograma de chamadas do código
+digraph {
+	A [label="Início"]
+	B [label=Processo]
+	A -> B
+}
